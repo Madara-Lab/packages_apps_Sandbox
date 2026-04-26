@@ -17,6 +17,7 @@ package com.android.axion.sandbox
 
 import android.app.Activity
 import android.app.AxSandboxManager
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.hardware.biometrics.BiometricManager
@@ -163,9 +164,10 @@ class AuthenticateActivity : ComponentActivity() {
     }
 
     private fun setupWindowForOverlay() {
-        window?.apply {
-            setType(WindowManager.LayoutParams.TYPE_STATUS_BAR_SUB_PANEL)
+        setShowWhenLocked(true)
+        setTurnScreenOn(true)
 
+        window?.apply {
             addFlags(
                 WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
                 WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
@@ -173,13 +175,19 @@ class AuthenticateActivity : ComponentActivity() {
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
             )
 
-            addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+            setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE or
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            )
 
             attributes = attributes?.apply {
                 privateFlags = privateFlags or
                     WindowManager.LayoutParams.SYSTEM_FLAG_SHOW_FOR_ALL_USERS
             }
         }
+
+        val km = getSystemService(KeyguardManager::class.java)
+        km?.requestDismissKeyguard(this, null)
     }
 
     private fun unlockAndFinish() {
