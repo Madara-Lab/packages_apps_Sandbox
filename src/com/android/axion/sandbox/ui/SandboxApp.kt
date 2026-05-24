@@ -76,7 +76,6 @@ import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
-import androidx.compose.material3.LargeTopAppBar
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -129,6 +128,8 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.FilterList
+import com.android.axion.compose.scaffold.AxionLargeTopAppBar
+import com.android.axion.compose.scaffold.ExpressiveBackButton
 import com.android.axion.sandbox.R
 import com.android.internal.app.IHiddenNotificationListener
 import com.android.internal.app.HiddenNotificationInfo
@@ -321,34 +322,36 @@ fun SandboxApp(
             modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
             containerColor = MaterialTheme.colorScheme.surfaceContainer,
             topBar = {
-                LargeTopAppBar(
-                    title = {
+                AxionLargeTopAppBar(
+                    title = stringResource(R.string.sandbox_title),
+                    scrollBehavior = scrollBehavior,
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    titleContent =
                         if (isSearchExpanded) {
-                            OutlinedTextField(
-                                value = searchQuery,
-                                onValueChange = { searchQuery = it },
-                                modifier = Modifier.fillMaxWidth(),
-                                placeholder = { Text(stringResource(R.string.search_hint)) },
-                                leadingIcon = {
-                                    Icon(
-                                        imageVector = Icons.Default.Search,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            {
+                                OutlinedTextField(
+                                    value = searchQuery,
+                                    onValueChange = { searchQuery = it },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    placeholder = { Text(stringResource(R.string.search_hint)) },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = Icons.Default.Search,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    },
+                                    singleLine = true,
+                                    shape = MaterialTheme.shapes.extraLarge,
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        unfocusedContainerColor = MaterialTheme.colorScheme.surfaceBright,
+                                        focusedContainerColor = MaterialTheme.colorScheme.surfaceBright,
+                                        unfocusedBorderColor = Color.Transparent,
+                                        focusedBorderColor = MaterialTheme.colorScheme.primary
                                     )
-                                },
-                                singleLine = true,
-                                shape = MaterialTheme.shapes.extraLarge,
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceBright,
-                                    focusedContainerColor = MaterialTheme.colorScheme.surfaceBright,
-                                    unfocusedBorderColor = Color.Transparent,
-                                    focusedBorderColor = MaterialTheme.colorScheme.primary
                                 )
-                            )
-                        } else {
-                            Text(stringResource(R.string.sandbox_title))
-                        }
-                    },
+                            }
+                        } else null,
                     actions = {
                         FilledIconToggleButton(
                             checked = isSearchExpanded,
@@ -419,11 +422,6 @@ fun SandboxApp(
                             )
                         }
                     },
-                    scrollBehavior = scrollBehavior,
-                    colors = TopAppBarDefaults.largeTopAppBarColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                        scrolledContainerColor = MaterialTheme.colorScheme.surfaceContainer
-                    )
                 )
             },
             bottomBar = {
@@ -724,20 +722,18 @@ fun AppDetailScreen(
     val bitmap = remember(app.packageName) {
         app.icon.toBitmap(128, 128)
     }
-    val motionScheme = MaterialTheme.motionScheme
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
 
     Scaffold(
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
         containerColor = MaterialTheme.colorScheme.surfaceContainer,
         topBar = {
-            LargeTopAppBar(
-                title = { Text(app.label) },
+            AxionLargeTopAppBar(
+                title = app.label,
+                scrollBehavior = scrollBehavior,
+                containerColor = MaterialTheme.colorScheme.surfaceContainer,
                 navigationIcon = {
-                    IconButton(onClick = onBackClick) {
-                        Icon(
-                            imageVector = Icons.Filled.Lock,
-                            contentDescription = stringResource(R.string.action_back)
-                        )
-                    }
+                    ExpressiveBackButton(onClick = onBackClick)
                 },
                 actions = {
                     FilledTonalIconButton(onClick = { onLaunch(app) }) {
@@ -747,9 +743,6 @@ fun AppDetailScreen(
                         )
                     }
                 },
-                colors = TopAppBarDefaults.largeTopAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainer
-                )
             )
         }
     ) { paddingValues ->

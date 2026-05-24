@@ -45,6 +45,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import com.android.axion.sandbox.io.BackupManager
+import com.android.axion.sandbox.io.VaultAccessController
 import com.android.axion.sandbox.security.LockedAppBehavior
 import com.android.axion.sandbox.security.PrivateSectionBehavior
 import com.android.axion.sandbox.security.SecurityType
@@ -101,6 +102,7 @@ class MainActivity : ComponentActivity() {
 
         securityManager = SandboxSecurityManager(this)
         backupManager = BackupManager(this)
+        VaultAccessController.lock(this)
 
         setContent {
             SandboxTheme {
@@ -169,6 +171,7 @@ fun SandboxNavigation(
     onRestoreAppList: () -> Unit
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
+    val context = LocalContext.current
 
     var currentScreen by rememberSaveable { 
         mutableStateOf(if (securityManager.isSetup()) SandboxScreen.MAIN else SandboxScreen.SETUP_TYPE_SELECTOR) 
@@ -198,7 +201,15 @@ fun SandboxNavigation(
     val currentScreenState = rememberUpdatedState(currentScreen)
     val currentPrivateBehaviorState = rememberUpdatedState(currentPrivateBehavior)
 
-    DisposableEffect(lifecycleOwner) {
+    LaunchedEffect(isPrivateUnlocked) {
+        if (isPrivateUnlocked) {
+            VaultAccessController.unlock()
+        } else {
+            VaultAccessController.lock(context)
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, context) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE && securityManager.isSetup() && !isPickingFiles) {
                 lastPauseTime = System.currentTimeMillis()
@@ -228,6 +239,7 @@ fun SandboxNavigation(
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            VaultAccessController.lock(context)
             lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }

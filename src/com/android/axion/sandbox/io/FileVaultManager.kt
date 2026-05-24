@@ -15,6 +15,7 @@
  */
 package com.android.axion.sandbox.io
 
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
@@ -25,6 +26,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Environment
 import android.os.UserHandle
+import android.provider.BaseColumns
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -36,37 +38,178 @@ import org.json.JSONObject
 import java.io.*
 import java.security.KeyStore
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
-import javax.crypto.CipherInputStream
-import javax.crypto.CipherOutputStream
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
+internal object VaultAccessController {
+    @Volatile
+    private var unlocked = false
+
+    fun unlock() {
+        unlocked = true
+    }
+
+    fun lock(context: Context) {
+        unlocked = false
+        FileVaultManager.clearDecryptedCache(context)
+    }
+
+    fun isUnlocked(): Boolean = unlocked
+}
+
 class FileVaultManager(private val context: Context) {
-    private val TAG = "FileVaultManager"
     private val KEY_ALIAS = "ax_vault_master_key"
     private val ALGORITHM = "AES/GCM/NoPadding"
     private val IO_BUFFER_SIZE = 65536
 
     private val dbHelper = VaultDbHelper(context)
-    private val currentUserId = UserHandle.myUserId()
 
     companion object {
+        private const val TAG = "FileVaultManager"
+        private const val BRIDGE_DIR_NAME = ".vault_bridge"
+        private const val LEGACY_BRIDGE_DIR_NAME = "vault_bridge"
+        private const val MEDIA_BRIDGE_DIR_NAME = "AxionVaultBridge"
+        private const val MEDIA_BRIDGE_PREFIX = "vault_"
+        private val mediaBridgeLocks = ConcurrentHashMap<String, Any>()
         private val thumbnailCache = LruCache<String, Bitmap>(50)
-    }
-    
-    private val bridgeDir: File by lazy {
-        File(context.externalCacheDir ?: context.cacheDir, "vault_bridge").apply { if (!exists()) mkdirs() }
+
+        internal fun getBridgeDir(context: Context): File {
+            val baseDir = context.externalMediaDirs.filterNotNull().firstOrNull()
+                ?: context.externalCacheDir
+                ?: context.cacheDir
+            return File(baseDir, BRIDGE_DIR_NAME).apply {
+                if (!exists()) mkdirs()
+                try { File(this, ".nomedia").createNewFile() } catch (e: Exception) {}
+                setExecutable(true, false)
+                setReadable(true, false)
+            }
+        }
+
+        internal fun getBridgeFile(context: Context, vaultFile: VaultFile): File =
+            File(getBridgeDir(context), "u${UserHandle.myUserId()}_${vaultFile.id}_${vaultFile.name}")
+
+        internal fun clearBridgeCache(context: Context, force: Boolean = false) {
+            val activeDir = getBridgeDir(context)
+            clearBridgeDir(activeDir, force)
+            if (force) {
+                clearBridgeDir(File(context.cacheDir, BRIDGE_DIR_NAME), true)
+                clearBridgeDir(File(context.cacheDir, LEGACY_BRIDGE_DIR_NAME), true)
+                context.externalCacheDir?.let {
+                    clearBridgeDir(File(it, BRIDGE_DIR_NAME), true)
+                    clearBridgeDir(File(it, LEGACY_BRIDGE_DIR_NAME), true)
+                }
+                context.externalMediaDirs.filterNotNull().forEach {
+                    clearBridgeDir(File(it, BRIDGE_DIR_NAME), true)
+                    clearBridgeDir(File(it, LEGACY_BRIDGE_DIR_NAME), true)
+                }
+            }
+        }
+
+        internal fun clearDecryptedCache(context: Context) {
+            clearMediaBridge(context)
+            clearBridgeCache(context, true)
+            File(context.cacheDir, "thumb_cache").deleteRecursively()
+            context.cacheDir.listFiles { file -> file.name.startsWith("v_thumb_") }?.forEach { it.delete() }
+            thumbnailCache.evictAll()
+        }
+
+        private fun mediaCollection(mimeType: String): Uri? = when {
+            mimeType.startsWith("image/", true) ->
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            mimeType.startsWith("video/", true) ->
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            else -> null
+        }
+
+        private fun mediaBridgeRelativePath(mimeType: String): String {
+            val directory = if (mimeType.startsWith("video/", true)) {
+                Environment.DIRECTORY_MOVIES
+            } else {
+                Environment.DIRECTORY_PICTURES
+            }
+            return "$directory/$MEDIA_BRIDGE_DIR_NAME/"
+        }
+
+        private fun mediaBridgeName(vaultFile: VaultFile): String =
+            "$MEDIA_BRIDGE_PREFIX${UserHandle.myUserId()}_${vaultFile.id}_${vaultFile.name}"
+
+        private fun findMediaBridgeUri(
+            context: Context,
+            collection: Uri,
+            displayName: String,
+            relativePath: String,
+            expectedSize: Long
+        ): Uri? = try {
+            val projection = arrayOf(
+                BaseColumns._ID,
+                MediaStore.MediaColumns.SIZE,
+                MediaStore.MediaColumns.IS_PENDING
+            )
+            val selection = "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND " +
+                "${MediaStore.MediaColumns.RELATIVE_PATH}=?"
+            val args = arrayOf(displayName, relativePath)
+            context.contentResolver.query(collection, projection, selection, args, null)?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val uri = ContentUris.withAppendedId(collection, cursor.getLong(0))
+                    if (cursor.getLong(1) == expectedSize && cursor.getInt(2) == 0) return uri
+                    context.contentResolver.delete(uri, null, null)
+                }
+            }
+            null
+        } catch (e: Exception) {
+            Log.w(TAG, "findMediaBridgeUri failed name=$displayName", e)
+            null
+        }
+
+        private fun clearMediaBridge(context: Context) {
+            deleteMediaBridgeRows(
+                context,
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                mediaBridgeRelativePath("image/jpeg")
+            )
+            deleteMediaBridgeRows(
+                context,
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                mediaBridgeRelativePath("video/mp4")
+            )
+            File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+                MEDIA_BRIDGE_DIR_NAME
+            ).deleteRecursively()
+            File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+                MEDIA_BRIDGE_DIR_NAME
+            ).deleteRecursively()
+        }
+
+        private fun deleteMediaBridgeRows(context: Context, collection: Uri, relativePath: String) {
+            try {
+                val selection = "${MediaStore.MediaColumns.RELATIVE_PATH}=? AND " +
+                    "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?"
+                val args = arrayOf(relativePath, "$MEDIA_BRIDGE_PREFIX%")
+                context.contentResolver.delete(collection, selection, args)
+            } catch (e: Exception) {
+                Log.w(TAG, "deleteMediaBridgeRows failed path=$relativePath", e)
+            }
+        }
+
+        private fun clearBridgeDir(dir: File, force: Boolean) {
+            val files = dir.listFiles() ?: return
+            val now = System.currentTimeMillis()
+            files.forEach { file ->
+                if (force || now - file.lastModified() > 300_000) file.delete()
+            }
+        }
     }
     
     private val vaultDir: File by lazy {
-        val sandboxManager = context.getSystemService(android.app.AxSandboxManager::class.java)
-        val path = try { sandboxManager?.fileVaultPath } catch (e: Exception) { null }
-        val dir = if (path != null) File(path) else File(context.filesDir, "vault")
-        if (!dir.exists()) dir.mkdirs()
-        try { File(dir, ".nomedia").createNewFile() } catch (e: Exception) {}
-        dir
+        File(context.filesDir, "vault").apply {
+            if (!exists()) mkdirs()
+            try { File(this, ".nomedia").createNewFile() } catch (e: Exception) {}
+        }
     }
 
     private val metadataFile: File by lazy { File(vaultDir, "metadata.json") }
@@ -97,7 +240,37 @@ class FileVaultManager(private val context: Context) {
         } catch (e: Exception) { null }
     }
 
-    internal fun getMasterKey(): SecretKey? = getSecretKey()
+    internal fun getMasterKey(): SecretKey? =
+        if (VaultAccessController.isUnlocked()) getSecretKey() else null
+
+    private fun decryptToOutput(vaultFile: VaultFile, output: OutputStream): Boolean {
+        val key = getSecretKey() ?: run {
+            Log.w(TAG, "decryptToOutput missing key id=${vaultFile.id}")
+            return false
+        }
+        val cipher = Cipher.getInstance(ALGORITHM)
+        FileInputStream(vaultFile.file).use { fis ->
+            val iv = ByteArray(12)
+            if (fis.read(iv) != 12) {
+                Log.w(TAG, "decryptToOutput short iv id=${vaultFile.id}")
+                return false
+            }
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+
+            val buffer = ByteArray(IO_BUFFER_SIZE)
+            while (true) {
+                val read = fis.read(buffer)
+                if (read == -1) break
+
+                val decrypted = cipher.update(buffer, 0, read)
+                if (decrypted != null) output.write(decrypted)
+            }
+            val finalBlock = cipher.doFinal()
+            if (finalBlock != null) output.write(finalBlock)
+            output.flush()
+        }
+        return true
+    }
 
     fun migrateLegacyIfNeeded() {
         if (!metadataFile.exists()) return
@@ -125,40 +298,106 @@ class FileVaultManager(private val context: Context) {
     }
 
     fun prepareFileForSharing(vaultFile: VaultFile): Boolean {
-        val tempFile = File(bridgeDir, "u${currentUserId}_${vaultFile.id}_${vaultFile.name}")
-        if (tempFile.exists() && tempFile.length() == vaultFile.size) return true
+        if (!VaultAccessController.isUnlocked()) {
+            Log.w(TAG, "prepareFileForSharing denied locked id=${vaultFile.id}")
+            return false
+        }
+
+        val tempFile = getBridgeFile(context, vaultFile)
+        if (tempFile.exists() && tempFile.length() == vaultFile.size) {
+            Log.i(TAG, "prepareFileForSharing bridge hit id=${vaultFile.id} length=${tempFile.length()} path=${tempFile.absolutePath}")
+            return true
+        }
 
         return try {
-            val key = getSecretKey() ?: return false
-            val cipher = Cipher.getInstance(ALGORITHM)
-            FileInputStream(vaultFile.file).use { fis ->
-                val iv = ByteArray(12)
-                if (fis.read(iv) != 12) return false
-                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
-                
-                FileOutputStream(tempFile).use { fos ->
-                    val buffer = ByteArray(IO_BUFFER_SIZE)
-                    while (true) {
-                        val read = fis.read(buffer)
-                        if (read == -1) break
-                        
-                        val decrypted = cipher.update(buffer, 0, read)
-                        if (decrypted != null) {
-                            fos.write(decrypted)
-                        }
-                    }
-                    val finalBlock = cipher.doFinal()
-                    if (finalBlock != null) {
-                        fos.write(finalBlock)
-                    }
-                    fos.flush()
+            FileOutputStream(tempFile).use { output ->
+                if (!decryptToOutput(vaultFile, output)) {
+                    tempFile.delete()
+                    return false
                 }
             }
+            if (!VaultAccessController.isUnlocked()) {
+                tempFile.delete()
+                return false
+            }
+            tempFile.parentFile?.setExecutable(true, false)
+            tempFile.parentFile?.setReadable(true, false)
             tempFile.setReadable(true, false)
+            Log.i(TAG, "prepareFileForSharing ready id=${vaultFile.id} length=${tempFile.length()} expected=${vaultFile.size} path=${tempFile.absolutePath}")
             true
         } catch (e: Exception) {
+            Log.w(TAG, "prepareFileForSharing failed id=${vaultFile.id}", e)
             tempFile.delete()
             false
+        }
+    }
+
+    fun prepareMediaStoreUri(vaultFile: VaultFile): Uri? =
+        synchronized(mediaBridgeLocks.computeIfAbsent(vaultFile.id) { Any() }) {
+            prepareMediaStoreUriLocked(vaultFile)
+        }
+
+    private fun prepareMediaStoreUriLocked(vaultFile: VaultFile): Uri? {
+        val collection = mediaCollection(vaultFile.mimeType) ?: return null
+        if (!VaultAccessController.isUnlocked()) {
+            Log.w(TAG, "prepareMediaStoreUri denied locked id=${vaultFile.id}")
+            return null
+        }
+
+        val relativePath = mediaBridgeRelativePath(vaultFile.mimeType)
+        val displayName = mediaBridgeName(vaultFile)
+        findMediaBridgeUri(
+            context,
+            collection,
+            displayName,
+            relativePath,
+            vaultFile.size
+        )?.let {
+            Log.i(TAG, "prepareMediaStoreUri hit id=${vaultFile.id} uri=$it")
+            return it
+        }
+
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, vaultFile.mimeType)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+            put(MediaStore.MediaColumns.SIZE, vaultFile.size)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+            put(MediaStore.MediaColumns.DATE_MODIFIED, System.currentTimeMillis() / 1000)
+        }
+
+        val uri = try {
+            context.contentResolver.insert(collection, values)
+        } catch (e: Exception) {
+            Log.w(TAG, "prepareMediaStoreUri insert failed id=${vaultFile.id}", e)
+            null
+        } ?: return null
+
+        return try {
+            context.contentResolver.openOutputStream(uri, "w")?.use { output ->
+                if (!decryptToOutput(vaultFile, output)) {
+                    context.contentResolver.delete(uri, null, null)
+                    return null
+                }
+            } ?: run {
+                context.contentResolver.delete(uri, null, null)
+                return null
+            }
+            if (!VaultAccessController.isUnlocked()) {
+                context.contentResolver.delete(uri, null, null)
+                return null
+            }
+            values.clear()
+            values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            values.put(MediaStore.MediaColumns.SIZE, vaultFile.size)
+            values.put(MediaStore.MediaColumns.DATE_MODIFIED, System.currentTimeMillis() / 1000)
+            context.contentResolver.update(uri, values, null, null)
+            Log.i(TAG, "prepareMediaStoreUri ready id=${vaultFile.id} uri=$uri length=${vaultFile.size}")
+            uri
+        } catch (e: Exception) {
+            Log.w(TAG, "prepareMediaStoreUri failed id=${vaultFile.id}", e)
+            context.contentResolver.delete(uri, null, null)
+            null
         }
     }
 
@@ -219,6 +458,7 @@ class FileVaultManager(private val context: Context) {
     fun restoreFiles(vaultFiles: List<VaultFile>): Int {
         var count = 0
         vaultFiles.forEach { if (restoreFile(it)) count++ }
+        if (count > 0) clearDecryptedCache(context)
         return count
     }
 
@@ -261,7 +501,10 @@ class FileVaultManager(private val context: Context) {
         } catch (e: Exception) { false }
     }
 
-    fun deleteFiles(vaultFiles: List<VaultFile>) { vaultFiles.forEach { deleteFile(it) } }
+    fun deleteFiles(vaultFiles: List<VaultFile>) {
+        vaultFiles.forEach { deleteFile(it) }
+        if (vaultFiles.isNotEmpty()) clearDecryptedCache(context)
+    }
 
     fun deleteFile(vaultFile: VaultFile): Boolean {
         dbHelper.deleteFile(vaultFile.id)
@@ -378,11 +621,7 @@ class FileVaultManager(private val context: Context) {
     }
 
     fun clearPublicBridge(force: Boolean = false) {
-        val files = bridgeDir.listFiles() ?: return
-        val now = System.currentTimeMillis()
-        files.forEach { file ->
-            if (force || (now - file.lastModified() > 300_000)) file.delete()
-        }
+        if (force) clearDecryptedCache(context) else clearBridgeCache(context)
     }
 
     private fun getFileName(uri: Uri): String? {

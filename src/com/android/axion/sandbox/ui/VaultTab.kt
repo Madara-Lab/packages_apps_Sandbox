@@ -15,14 +15,10 @@
  */
 package com.android.axion.sandbox.ui
 
-import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
-import android.provider.DocumentsContract
-import android.provider.MediaStore
-import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -54,13 +50,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.android.axion.sandbox.R
 import com.android.axion.sandbox.io.FileVaultManager
 import com.android.axion.sandbox.io.VaultFile
 import kotlinx.coroutines.*
-import java.io.File
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -79,13 +75,24 @@ fun VaultTab(
     val vaultManager = remember { FileVaultManager(context) }
     var files by remember { mutableStateOf<List<VaultFile>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
+    val preparedMediaUris = remember { mutableStateMapOf<String, Uri>() }
 
     fun refreshFiles() {
+        val shouldEagerPrepareVideo = isLoading
         scope.launch(Dispatchers.IO) {
             try {
                 vaultManager.migrateLegacyIfNeeded()
                 val list = vaultManager.getVaultFiles()
+                val eagerFile = if (shouldEagerPrepareVideo) {
+                    list.firstOrNull { it.mimeType.startsWith("video/") }
+                } else {
+                    null
+                }
+                val eagerUri = eagerFile?.let { vaultManager.prepareMediaStoreUri(it) }
                 withContext(Dispatchers.Main) {
+                    if (eagerFile != null && eagerUri != null) {
+                        preparedMediaUris[eagerFile.id] = eagerUri
+                    }
                     files = list
                     isLoading = false
                 }
@@ -122,6 +129,29 @@ fun VaultTab(
     }
 
     LaunchedEffect(Unit) { refreshFiles() }
+
+    LaunchedEffect(files) {
+        val activeIds = files.mapTo(HashSet(files.size)) { it.id }
+        preparedMediaUris.keys.toList().forEach {
+            if (it !in activeIds) preparedMediaUris.remove(it)
+        }
+
+        val (pendingVideos, pendingImages) = files
+            .filter { it.isMediaStoreShareable() && preparedMediaUris[it.id] == null }
+            .partition { it.mimeType.startsWith("video/") }
+        val pendingMedia = pendingVideos + pendingImages
+        withContext(Dispatchers.IO) {
+            pendingMedia.forEach { file ->
+                ensureActive()
+                val uri = vaultManager.prepareMediaStoreUri(file)
+                if (uri != null) {
+                    withContext(Dispatchers.Main) {
+                        preparedMediaUris[file.id] = uri
+                    }
+                }
+            }
+        }
+    }
 
     val pickFilesLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
@@ -179,17 +209,22 @@ fun VaultTab(
     fun handleOpenFile(file: VaultFile) {
         isProcessing = true
         processingMessage = "Opening..."
+        val preparedUri = preparedMediaUris[file.id]
         scope.launch(Dispatchers.IO) {
             try {
-                val success = withTimeoutOrNull(45000) { 
-                    vaultManager.prepareFileForSharing(file)
-                } ?: false
+                val shareUri = preparedUri ?: withTimeoutOrNull(45000) {
+                    vaultManager.prepareMediaStoreUri(file)
+                        ?: if (vaultManager.prepareFileForSharing(file)) vaultContentUri(file) else null
+                }
                 
                 withContext(Dispatchers.Main) {
                     isProcessing = false
-                    if (success) {
+                    if (shareUri != null) {
+                        if (file.isMediaStoreShareable() && shareUri.authority != VAULT_AUTHORITY) {
+                            preparedMediaUris[file.id] = shareUri
+                        }
                         onPickingFilesChange(true)
-                        openVaultFileInternal(context, file)
+                        openVaultFileInternal(context, file, shareUri)
                     } else {
                         Toast.makeText(context, "Failed to open", Toast.LENGTH_SHORT).show()
                     }
@@ -254,7 +289,9 @@ fun VaultTab(
         },
         containerColor = Color.Transparent
     ) { paddingValues ->
-        if (files.isEmpty() && !isLoading) {
+        if (isLoading) {
+            VaultLoadingScreen(paddingValues)
+        } else if (files.isEmpty()) {
             EmptyVaultScreen(paddingValues)
         } else {
             LazyVerticalGrid(
@@ -311,13 +348,40 @@ fun VaultTab(
     }
 
     if (isProcessing) {
-        AlertDialog(onDismissRequest = {}, confirmButton = {}, title = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 3.dp)
-                Spacer(modifier = Modifier.width(16.dp))
-                Text(processingMessage)
+        Dialog(onDismissRequest = {}) {
+            Surface(
+                shape = MaterialTheme.shapes.extraLarge,
+                color = MaterialTheme.colorScheme.surfaceContainerHigh
+            ) {
+                Row(
+                    modifier = Modifier
+                        .widthIn(min = 240.dp)
+                        .padding(horizontal = 24.dp, vertical = 20.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    LoadingIndicator(modifier = Modifier.size(48.dp))
+                    Text(
+                        text = processingMessage,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
             }
-        })
+        }
+    }
+}
+
+@Composable
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+private fun VaultLoadingScreen(paddingValues: PaddingValues) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(paddingValues),
+        contentAlignment = Alignment.Center
+    ) {
+        LoadingIndicator()
     }
 }
 
@@ -382,19 +446,28 @@ private fun FileListItem(file: VaultFile, isSelected: Boolean, onClick: () -> Un
     }
 }
 
-private fun openVaultFileInternal(context: Context, file: VaultFile) {
+private fun vaultContentUri(file: VaultFile): Uri =
+    Uri.parse("content://$VAULT_AUTHORITY/${file.id}")
+
+private fun VaultFile.isMediaStoreShareable(): Boolean =
+    mimeType.startsWith("image/") || mimeType.startsWith("video/")
+
+private fun openVaultFileInternal(context: Context, file: VaultFile, uri: Uri) {
     try {
-        val uri = Uri.parse("content://com.android.axion.sandbox.vault/${file.id}")
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, file.mimeType)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-            clipData = ClipData.newRawUri(null, uri)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (uri.authority == VAULT_AUTHORITY) {
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
         }
         val chooser = Intent.createChooser(intent, "Open with")
         chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(chooser)
     } catch (e: Exception) {}
 }
+
+private const val VAULT_AUTHORITY = "com.android.axion.sandbox.vault"
 
 private fun formatFileSize(size: Long): String {
     if (size <= 0) return "0 B"

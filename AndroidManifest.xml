@@ -56,6 +56,7 @@
             android:name=".io.VaultFileProvider"
             android:authorities="com.android.axion.sandbox.vault"
             android:exported="true"
+            android:forceUriPermissions="true"
             android:grantUriPermissions="true" />
 
         <!-- Standard FileProvider for internal cache sharing -->

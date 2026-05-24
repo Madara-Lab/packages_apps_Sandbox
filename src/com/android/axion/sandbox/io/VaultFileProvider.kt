@@ -17,35 +17,56 @@ package com.android.axion.sandbox.io
 
 import android.content.ContentProvider
 import android.content.ContentValues
+import android.content.ClipDescription
+import android.content.Context
+import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
+import android.os.Binder
+import android.os.Bundle
 import android.os.ParcelFileDescriptor
-import android.os.UserHandle
 import android.provider.BaseColumns
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Log
-import java.io.*
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 
 class VaultFileProvider : ContentProvider() {
-    private val TAG = "VaultFileProvider"
     private val bridgeLock = Any()
 
-    override fun onCreate(): Boolean = true
+    private fun caller(): String = try {
+        "${getCallingPackage() ?: "unknown"}/${Binder.getCallingUid()}"
+    } catch (e: SecurityException) {
+        "invalid/${Binder.getCallingUid()}"
+    }
+
+    override fun onCreate(): Boolean {
+        context?.let {
+            if (!VaultAccessController.isUnlocked()) FileVaultManager.clearDecryptedCache(it)
+        }
+        return true
+    }
 
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor? {
+        if (!VaultAccessController.isUnlocked()) {
+            Log.w(TAG, "openFile denied locked caller=${caller()} uri=$uri mode=$mode")
+            return null
+        }
+
         val context = context ?: return null
         val fileId = uri.lastPathSegment ?: return null
         val vaultManager = FileVaultManager(context)
-        val vaultFile = vaultManager.getFileById(fileId) ?: return null
-        
-        val currentUserId = UserHandle.myUserId()
-        val bridgeDir = File(context.externalCacheDir ?: context.cacheDir, "vault_bridge")
-        val tempFile = File(bridgeDir, "u${currentUserId}_${vaultFile.id}_${vaultFile.name}")
-        
+        val vaultFile = vaultManager.getFileById(fileId) ?: run {
+            Log.w(TAG, "openFile missing id=$fileId caller=${caller()} uri=$uri")
+            return null
+        }
+        val tempFile = FileVaultManager.getBridgeFile(context, vaultFile)
+        Log.i(TAG, "openFile caller=${caller()} id=$fileId mode=$mode mime=${vaultFile.mimeType} exists=${tempFile.exists()} length=${tempFile.length()} expected=${vaultFile.size} path=${tempFile.absolutePath}")
+
         return if (tempFile.exists() && tempFile.length() == vaultFile.size) {
             ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
         } else {
@@ -53,24 +74,24 @@ class VaultFileProvider : ContentProvider() {
         }
     }
 
-    private fun openSeekableFile(context: android.content.Context, vaultManager: FileVaultManager, vaultFile: VaultFile): ParcelFileDescriptor? {
+    private fun openSeekableFile(context: Context, vaultManager: FileVaultManager, vaultFile: VaultFile): ParcelFileDescriptor? =
         synchronized(bridgeLock) {
             try {
-                val currentUserId = UserHandle.myUserId()
-                val bridgeDir = File(context.externalCacheDir ?: context.cacheDir, "vault_bridge").apply { if (!exists()) mkdirs() }
-                val tempFile = File(bridgeDir, "u${currentUserId}_${vaultFile.id}_${vaultFile.name}")
-                
+                val tempFile = FileVaultManager.getBridgeFile(context, vaultFile)
                 if (tempFile.exists() && tempFile.length() == vaultFile.size) {
                     return ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
                 }
 
-                val key = vaultManager.getMasterKey() ?: return null
+                val key = vaultManager.getMasterKey() ?: run {
+                    Log.w(TAG, "openSeekableFile missing key caller=${caller()} id=${vaultFile.id}")
+                    return null
+                }
                 FileInputStream(vaultFile.file).use { fis ->
                     val iv = ByteArray(12)
                     if (fis.read(iv) == 12) {
                         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
                         cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
-                        
+
                         FileOutputStream(tempFile).use { fos ->
                             val buffer = ByteArray(65536)
                             while (true) {
@@ -83,20 +104,60 @@ class VaultFileProvider : ContentProvider() {
                             if (finalBlock != null) fos.write(finalBlock)
                             fos.flush()
                         }
+                    } else {
+                        Log.w(TAG, "openSeekableFile short iv caller=${caller()} id=${vaultFile.id}")
                     }
                 }
+                tempFile.parentFile?.setExecutable(true, false)
+                tempFile.parentFile?.setReadable(true, false)
                 tempFile.setReadable(true, false)
-                return ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                Log.i(TAG, "openSeekableFile ready caller=${caller()} id=${vaultFile.id} length=${tempFile.length()} expected=${vaultFile.size} path=${tempFile.absolutePath}")
+                ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
             } catch (e: Exception) {
-                return null
+                Log.w(TAG, "openSeekableFile failed caller=${caller()} id=${vaultFile.id}", e)
+                null
             }
         }
+
+    override fun openAssetFile(uri: Uri, mode: String): AssetFileDescriptor? {
+        val descriptor = openFile(uri, mode) ?: return null
+        val length = descriptor.statSize
+        Log.i(TAG, "openAssetFile caller=${caller()} uri=$uri mode=$mode length=$length")
+        return AssetFileDescriptor(
+            descriptor,
+            0,
+            if (length >= 0) length else AssetFileDescriptor.UNKNOWN_LENGTH
+        )
+    }
+
+    override fun openTypedAssetFile(uri: Uri, mimeTypeFilter: String, opts: Bundle?): AssetFileDescriptor? {
+        val type = getType(uri) ?: return null
+        val matches = ClipDescription.compareMimeTypes(type, mimeTypeFilter)
+        Log.i(TAG, "openTypedAssetFile caller=${caller()} uri=$uri filter=$mimeTypeFilter type=$type matches=$matches")
+        if (!matches) return null
+        return openAssetFile(uri, "r")
+    }
+
+    override fun getStreamTypes(uri: Uri, mimeTypeFilter: String): Array<String>? {
+        val type = getType(uri) ?: return null
+        val matches = ClipDescription.compareMimeTypes(type, mimeTypeFilter)
+        Log.i(TAG, "getStreamTypes caller=${caller()} uri=$uri filter=$mimeTypeFilter type=$type matches=$matches")
+        return if (matches) arrayOf(type) else null
     }
 
     override fun query(uri: Uri, projection: Array<String>?, selection: String?, selectionArgs: Array<String>?, sortOrder: String?): Cursor? {
+        if (!VaultAccessController.isUnlocked()) {
+            Log.w(TAG, "query denied locked caller=${caller()} uri=$uri projection=${projection?.contentToString()}")
+            return null
+        }
+
         val context = context ?: return null
         val fileId = uri.lastPathSegment ?: return null
-        val vaultFile = FileVaultManager(context).getFileById(fileId) ?: return null
+        val vaultManager = FileVaultManager(context)
+        val vaultFile = vaultManager.getFileById(fileId) ?: run {
+            Log.w(TAG, "query missing id=$fileId caller=${caller()} uri=$uri projection=${projection?.contentToString()}")
+            return null
+        }
 
         val columnNames = projection ?: arrayOf(
             BaseColumns._ID, OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE,
@@ -107,10 +168,13 @@ class VaultFileProvider : ContentProvider() {
         
         val cursor = MatrixCursor(columnNames, 1)
         val row = cursor.newRow()
-        
-        val currentUserId = UserHandle.myUserId()
-        val bridgeDir = File(context.externalCacheDir ?: context.cacheDir, "vault_bridge")
-        val bridgePath = File(bridgeDir, "u${currentUserId}_${vaultFile.id}_${vaultFile.name}").absolutePath
+        val needsDataPath = columnNames.contains(MediaStore.MediaColumns.DATA)
+        val bridgePath = if (needsDataPath && vaultManager.prepareFileForSharing(vaultFile)) {
+            FileVaultManager.getBridgeFile(context, vaultFile).absolutePath
+        } else {
+            null
+        }
+        Log.i(TAG, "query caller=${caller()} id=$fileId projection=${columnNames.contentToString()} mime=${vaultFile.mimeType} needsData=$needsDataPath bridge=$bridgePath size=${vaultFile.size}")
 
         for (column in columnNames) {
             when (column) {
@@ -127,9 +191,20 @@ class VaultFileProvider : ContentProvider() {
     }
 
     override fun getType(uri: Uri): String? {
+        if (!VaultAccessController.isUnlocked()) {
+            Log.w(TAG, "getType denied locked caller=${caller()} uri=$uri")
+            return null
+        }
+
         val context = context ?: return null
         val fileId = uri.lastPathSegment ?: return null
-        return FileVaultManager(context).getFileById(fileId)?.mimeType
+        val type = FileVaultManager(context).getFileById(fileId)?.mimeType
+        Log.i(TAG, "getType caller=${caller()} id=$fileId type=$type uri=$uri")
+        return type
+    }
+
+    private companion object {
+        private const val TAG = "VaultFileProvider"
     }
 
     override fun insert(uri: Uri, values: ContentValues?): Uri? = null
