@@ -1,10 +1,13 @@
 package com.android.axion.sandbox.security
 
 import android.content.Context
-import android.content.SharedPreferences
 import android.hardware.biometrics.BiometricManager
 import android.provider.Settings
+import android.util.Base64
 import java.security.MessageDigest
+import java.security.SecureRandom
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.PBEKeySpec
 
 enum class SecurityType {
     NONE,
@@ -77,10 +80,7 @@ class SandboxSecurityManager(private val context: Context) {
     }
     
     fun verifyCredential(credential: String): Boolean {
-        val storedHash = Settings.Secure.getString(context.contentResolver, KEY_CREDENTIAL_HASH)
-            ?: return false
-        val inputHash = hashCredential(credential)
-        return storedHash == inputHash
+        return verifyStoredCredential(credential, KEY_CREDENTIAL_HASH)
     }
     
     fun verifyPattern(pattern: List<Int>): Boolean {
@@ -174,7 +174,69 @@ class SandboxSecurityManager(private val context: Context) {
     }
     
     private fun hashCredential(credential: String): String {
-        val bytes = MessageDigest.getInstance("SHA-256").digest(credential.toByteArray())
+        val salt = ByteArray(CREDENTIAL_SALT_BYTES).also { SecureRandom().nextBytes(it) }
+        val hash = deriveCredential(credential, salt, PBKDF2_ITERATIONS)
+        return listOf(
+            PBKDF2_PREFIX,
+            PBKDF2_ITERATIONS.toString(),
+            Base64.encodeToString(salt, Base64.NO_WRAP),
+            Base64.encodeToString(hash, Base64.NO_WRAP)
+        ).joinToString(CREDENTIAL_HASH_SEPARATOR)
+    }
+
+    private fun verifyStoredCredential(credential: String, setting: String): Boolean {
+        val storedHash = Settings.Secure.getString(context.contentResolver, setting)
+            ?: return false
+        val isLegacy = isLegacyHash(storedHash)
+        val matches = if (isLegacy) {
+            MessageDigest.isEqual(
+                legacyHash(credential).toByteArray(Charsets.UTF_8),
+                storedHash.toByteArray(Charsets.UTF_8)
+            )
+        } else {
+            verifyPbkdf2Hash(credential, storedHash)
+        }
+        if (matches && isLegacy) {
+            Settings.Secure.putString(context.contentResolver, setting, hashCredential(credential))
+        }
+        return matches
+    }
+
+    private fun verifyPbkdf2Hash(credential: String, storedHash: String): Boolean {
+        val parts = storedHash.split(CREDENTIAL_HASH_SEPARATOR)
+        if (parts.size != 4 || parts[0] != PBKDF2_PREFIX) return false
+        val iterations = parts[1].toIntOrNull()
+            ?.takeIf { it == PBKDF2_ITERATIONS } ?: return false
+        if (parts[2].length != ENCODED_SALT_LENGTH ||
+            parts[3].length != ENCODED_HASH_LENGTH) return false
+        return try {
+            val salt = Base64.decode(parts[2], Base64.NO_WRAP)
+            val expected = Base64.decode(parts[3], Base64.NO_WRAP)
+            if (salt.size != CREDENTIAL_SALT_BYTES || expected.size != CREDENTIAL_HASH_BYTES) {
+                return false
+            }
+            val actual = deriveCredential(credential, salt, iterations)
+            MessageDigest.isEqual(expected, actual)
+        } catch (e: IllegalArgumentException) {
+            false
+        }
+    }
+
+    private fun deriveCredential(credential: String, salt: ByteArray, iterations: Int): ByteArray {
+        val spec = PBEKeySpec(credential.toCharArray(), salt, iterations, CREDENTIAL_HASH_BYTES * 8)
+        return try {
+            SecretKeyFactory.getInstance(PBKDF2_ALGORITHM).generateSecret(spec).encoded
+        } finally {
+            spec.clearPassword()
+        }
+    }
+
+    private fun isLegacyHash(hash: String): Boolean =
+        hash.length == LEGACY_HASH_LENGTH && hash.all { it.isDigit() || it in 'a'..'f' }
+
+    private fun legacyHash(credential: String): String {
+        val bytes = MessageDigest.getInstance("SHA-256")
+            .digest(credential.toByteArray(Charsets.UTF_8))
         return bytes.joinToString("") { "%02x".format(it) }
     }
     
@@ -200,8 +262,9 @@ class SandboxSecurityManager(private val context: Context) {
     }
     
     fun setSecurityQuestion(question: String, answer: String) {
+        val answerHash = hashCredential(answer.lowercase().trim())
         Settings.Secure.putString(context.contentResolver, KEY_SECURITY_QUESTION, question)
-        Settings.Secure.putString(context.contentResolver, KEY_SECURITY_ANSWER, hashCredential(answer.lowercase().trim()))
+        Settings.Secure.putString(context.contentResolver, KEY_SECURITY_ANSWER, answerHash)
     }
     
     fun getSecurityQuestion(): String? {
@@ -214,10 +277,7 @@ class SandboxSecurityManager(private val context: Context) {
     }
     
     fun verifySecurityAnswer(answer: String): Boolean {
-        val storedHash = Settings.Secure.getString(context.contentResolver, KEY_SECURITY_ANSWER)
-            ?: return false
-        val inputHash = hashCredential(answer.lowercase().trim())
-        return storedHash == inputHash
+        return verifyStoredCredential(answer.lowercase().trim(), KEY_SECURITY_ANSWER)
     }
     
     fun clearCredentials() {
@@ -239,6 +299,15 @@ class SandboxSecurityManager(private val context: Context) {
         private const val KEY_PREFER_BIOMETRIC = "sandbox_prefer_biometric"
         private const val KEY_SECURITY_QUESTION = "sandbox_security_question"
         private const val KEY_SECURITY_ANSWER = "sandbox_security_answer"
+        private const val PBKDF2_ALGORITHM = "PBKDF2WithHmacSHA256"
+        private const val PBKDF2_PREFIX = "pbkdf2_sha256"
+        private const val CREDENTIAL_HASH_SEPARATOR = ":"
+        private const val PBKDF2_ITERATIONS = 600_000
+        private const val CREDENTIAL_SALT_BYTES = 16
+        private const val CREDENTIAL_HASH_BYTES = 32
+        private const val ENCODED_SALT_LENGTH = 24
+        private const val ENCODED_HASH_LENGTH = 44
+        private const val LEGACY_HASH_LENGTH = 64
         const val SETTING_LOCKED_APP_BEHAVIOR = "sandbox_locked_app_behavior"
         
         
