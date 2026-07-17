@@ -249,10 +249,8 @@ class AuthenticateActivity : ComponentActivity() {
         }
 
         val timeSinceFailed = SystemClock.elapsedRealtime() - failedTime
-        val isMultiWindow = WindowModeUtil.isAppInMultiWindowMode()
-        val isFreeform = WindowModeUtil.isAppInFreeformMode()
 
-        if (hasFocus && !isMultiWindow && !isFreeform) {
+        if (hasFocus && !isInMultiWindowMode) {
             if (timeSinceFailed in 1..280 && isScreenOn()) {
                 Intent(Intent.ACTION_MAIN).apply {
                     addCategory(Intent.CATEGORY_HOME)
