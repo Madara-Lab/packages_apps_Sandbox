@@ -55,7 +55,7 @@
         <provider
             android:name=".io.VaultFileProvider"
             android:authorities="com.android.axion.sandbox.vault"
-            android:exported="true"
+            android:exported="false"
             android:forceUriPermissions="true"
             android:grantUriPermissions="true" />
 

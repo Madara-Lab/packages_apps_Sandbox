@@ -15,30 +15,46 @@
  */
 package com.android.axion.sandbox.io
 
-import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.hardware.security.keymint.Algorithm
+import android.hardware.security.keymint.BlockMode
+import android.hardware.security.keymint.KeyParameter
+import android.hardware.security.keymint.KeyParameterValue
+import android.hardware.security.keymint.KeyPurpose
+import android.hardware.security.keymint.PaddingMode
+import android.hardware.security.keymint.Tag
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Environment
-import android.os.UserHandle
-import android.provider.BaseColumns
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.security.KeyStore2
+import android.security.KeyStoreException
+import android.security.KeyStoreOperation
+import android.security.KeyStoreSecurityLevel
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.system.Os
+import android.system.OsConstants
+import android.system.keystore2.Domain
+import android.system.keystore2.KeyDescriptor
 import android.util.Log
 import android.util.LruCache
 import org.json.JSONObject
-import java.io.*
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.OutputStream
 import java.security.KeyStore
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -63,7 +79,7 @@ internal object VaultAccessController {
 class FileVaultManager(private val context: Context) {
     private val KEY_ALIAS = "ax_vault_master_key"
     private val ALGORITHM = "AES/GCM/NoPadding"
-    private val IO_BUFFER_SIZE = 65536
+    private val IO_BUFFER_SIZE = 32768
 
     private val dbHelper = VaultDbHelper(context)
 
@@ -73,55 +89,16 @@ class FileVaultManager(private val context: Context) {
         private const val LEGACY_BRIDGE_DIR_NAME = "vault_bridge"
         private const val MEDIA_BRIDGE_DIR_NAME = "AxionVaultBridge"
         private const val MEDIA_BRIDGE_PREFIX = "vault_"
-        private val mediaBridgeLocks = ConcurrentHashMap<String, Any>()
+        private const val IV_SIZE = 12
+        private const val GCM_TAG_SIZE = 16
         private val thumbnailCache = LruCache<String, Bitmap>(50)
-
-        internal fun getBridgeDir(context: Context): File {
-            val baseDir = context.externalMediaDirs.filterNotNull().firstOrNull()
-                ?: context.externalCacheDir
-                ?: context.cacheDir
-            return File(baseDir, BRIDGE_DIR_NAME).apply {
-                if (!exists()) mkdirs()
-                try { File(this, ".nomedia").createNewFile() } catch (e: Exception) {}
-                setExecutable(true, false)
-                setReadable(true, false)
-            }
-        }
-
-        internal fun getBridgeFile(context: Context, vaultFile: VaultFile): File =
-            File(getBridgeDir(context), "u${UserHandle.myUserId()}_${vaultFile.id}_${vaultFile.name}")
-
-        internal fun clearBridgeCache(context: Context, force: Boolean = false) {
-            val activeDir = getBridgeDir(context)
-            clearBridgeDir(activeDir, force)
-            if (force) {
-                clearBridgeDir(File(context.cacheDir, BRIDGE_DIR_NAME), true)
-                clearBridgeDir(File(context.cacheDir, LEGACY_BRIDGE_DIR_NAME), true)
-                context.externalCacheDir?.let {
-                    clearBridgeDir(File(it, BRIDGE_DIR_NAME), true)
-                    clearBridgeDir(File(it, LEGACY_BRIDGE_DIR_NAME), true)
-                }
-                context.externalMediaDirs.filterNotNull().forEach {
-                    clearBridgeDir(File(it, BRIDGE_DIR_NAME), true)
-                    clearBridgeDir(File(it, LEGACY_BRIDGE_DIR_NAME), true)
-                }
-            }
-        }
 
         internal fun clearDecryptedCache(context: Context) {
             clearMediaBridge(context)
-            clearBridgeCache(context, true)
+            clearLegacyBridgeDirs(context)
             File(context.cacheDir, "thumb_cache").deleteRecursively()
             context.cacheDir.listFiles { file -> file.name.startsWith("v_thumb_") }?.forEach { it.delete() }
             thumbnailCache.evictAll()
-        }
-
-        private fun mediaCollection(mimeType: String): Uri? = when {
-            mimeType.startsWith("image/", true) ->
-                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-            mimeType.startsWith("video/", true) ->
-                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-            else -> null
         }
 
         private fun mediaBridgeRelativePath(mimeType: String): String {
@@ -131,37 +108,6 @@ class FileVaultManager(private val context: Context) {
                 Environment.DIRECTORY_PICTURES
             }
             return "$directory/$MEDIA_BRIDGE_DIR_NAME/"
-        }
-
-        private fun mediaBridgeName(vaultFile: VaultFile): String =
-            "$MEDIA_BRIDGE_PREFIX${UserHandle.myUserId()}_${vaultFile.id}_${vaultFile.name}"
-
-        private fun findMediaBridgeUri(
-            context: Context,
-            collection: Uri,
-            displayName: String,
-            relativePath: String,
-            expectedSize: Long
-        ): Uri? = try {
-            val projection = arrayOf(
-                BaseColumns._ID,
-                MediaStore.MediaColumns.SIZE,
-                MediaStore.MediaColumns.IS_PENDING
-            )
-            val selection = "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND " +
-                "${MediaStore.MediaColumns.RELATIVE_PATH}=?"
-            val args = arrayOf(displayName, relativePath)
-            context.contentResolver.query(collection, projection, selection, args, null)?.use { cursor ->
-                while (cursor.moveToNext()) {
-                    val uri = ContentUris.withAppendedId(collection, cursor.getLong(0))
-                    if (cursor.getLong(1) == expectedSize && cursor.getInt(2) == 0) return uri
-                    context.contentResolver.delete(uri, null, null)
-                }
-            }
-            null
-        } catch (e: Exception) {
-            Log.w(TAG, "findMediaBridgeUri failed name=$displayName", e)
-            null
         }
 
         private fun clearMediaBridge(context: Context) {
@@ -196,11 +142,15 @@ class FileVaultManager(private val context: Context) {
             }
         }
 
-        private fun clearBridgeDir(dir: File, force: Boolean) {
-            val files = dir.listFiles() ?: return
-            val now = System.currentTimeMillis()
-            files.forEach { file ->
-                if (force || now - file.lastModified() > 300_000) file.delete()
+        private fun clearLegacyBridgeDirs(context: Context) {
+            val roots = buildList {
+                add(context.cacheDir)
+                context.externalCacheDir?.let { add(it) }
+                addAll(context.externalMediaDirs.filterNotNull())
+            }
+            roots.forEach { root ->
+                File(root, BRIDGE_DIR_NAME).deleteRecursively()
+                File(root, LEGACY_BRIDGE_DIR_NAME).deleteRecursively()
             }
         }
     }
@@ -240,36 +190,112 @@ class FileVaultManager(private val context: Context) {
         } catch (e: Exception) { null }
     }
 
-    internal fun getMasterKey(): SecretKey? =
-        if (VaultAccessController.isUnlocked()) getSecretKey() else null
-
     private fun decryptToOutput(vaultFile: VaultFile, output: OutputStream): Boolean {
-        val key = getSecretKey() ?: run {
-            Log.w(TAG, "decryptToOutput missing key id=${vaultFile.id}")
-            return false
-        }
-        val cipher = Cipher.getInstance(ALGORITHM)
-        FileInputStream(vaultFile.file).use { fis ->
-            val iv = ByteArray(12)
-            if (fis.read(iv) != 12) {
-                Log.w(TAG, "decryptToOutput short iv id=${vaultFile.id}")
-                return false
-            }
-            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+        var operation: KeyStoreOperation? = null
+        var finished = false
+        return try {
+            FileInputStream(vaultFile.file).use { input ->
+                val iv = ByteArray(IV_SIZE)
+                if (input.read(iv) != IV_SIZE) {
+                    Log.w(TAG, "decryptToOutput short iv id=${vaultFile.id}")
+                    return false
+                }
 
-            val buffer = ByteArray(IO_BUFFER_SIZE)
-            while (true) {
-                val read = fis.read(buffer)
-                if (read == -1) break
-
-                val decrypted = cipher.update(buffer, 0, read)
-                if (decrypted != null) output.write(decrypted)
+                val decryptOperation = createDecryptOperation(iv)
+                operation = decryptOperation
+                val buffer = ByteArray(IO_BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read == -1) break
+                    val decrypted = decryptOperation.update(
+                        if (read == buffer.size) buffer else buffer.copyOf(read)
+                    )
+                    if (decrypted != null && decrypted.isNotEmpty()) output.write(decrypted)
+                }
+                val finalBlock = decryptOperation.finish(null, null)
+                finished = true
+                if (finalBlock != null && finalBlock.isNotEmpty()) output.write(finalBlock)
+                output.flush()
             }
-            val finalBlock = cipher.doFinal()
-            if (finalBlock != null) output.write(finalBlock)
-            output.flush()
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "decryptToOutput failed id=${vaultFile.id}", e)
+            false
+        } finally {
+            if (!finished) {
+                try {
+                    operation?.abort()
+                } catch (e: KeyStoreException) {
+                    Log.w(TAG, "decryptToOutput abort failed id=${vaultFile.id}", e)
+                }
+            }
         }
-        return true
+    }
+
+    private fun createDecryptOperation(iv: ByteArray): KeyStoreOperation {
+        val descriptor = KeyDescriptor().apply {
+            domain = Domain.APP
+            nspace = KeyProperties.NAMESPACE_APPLICATION.toLong()
+            alias = KEY_ALIAS
+            blob = null
+        }
+        val entry = KeyStore2.getInstance().getKeyEntry(descriptor)
+        val securityLevel = entry.iSecurityLevel
+            ?: throw IllegalStateException("Missing vault key security level")
+        val parameters = listOf(
+            keyParameter(Tag.PURPOSE, KeyParameterValue.keyPurpose(KeyPurpose.DECRYPT)),
+            keyParameter(Tag.ALGORITHM, KeyParameterValue.algorithm(Algorithm.AES)),
+            keyParameter(Tag.BLOCK_MODE, KeyParameterValue.blockMode(BlockMode.GCM)),
+            keyParameter(Tag.PADDING, KeyParameterValue.paddingMode(PaddingMode.NONE)),
+            keyParameter(Tag.NONCE, KeyParameterValue.blob(iv)),
+            keyParameter(Tag.MAC_LENGTH, KeyParameterValue.integer(GCM_TAG_SIZE * 8))
+        )
+        return KeyStoreSecurityLevel(securityLevel).createOperation(entry.metadata.key, parameters)
+    }
+
+    private fun keyParameter(tag: Int, value: KeyParameterValue): KeyParameter =
+        KeyParameter().apply {
+            this.tag = tag
+            this.value = value
+        }
+
+    internal fun openDecryptedFile(vaultFile: VaultFile): ParcelFileDescriptor? {
+        if (!VaultAccessController.isUnlocked()) {
+            Log.w(TAG, "openDecryptedFile denied locked id=${vaultFile.id}")
+            return null
+        }
+
+        val tempFile = File.createTempFile("vault_", ".tmp", context.cacheDir)
+        var writer: ParcelFileDescriptor? = null
+        var reader: ParcelFileDescriptor? = null
+        return try {
+            val outputDescriptor = ParcelFileDescriptor.open(
+                tempFile,
+                ParcelFileDescriptor.MODE_READ_WRITE
+            )
+            writer = outputDescriptor
+            if (!tempFile.delete()) return null
+            val inputDescriptor = ParcelFileDescriptor.dup(outputDescriptor.fileDescriptor)
+            reader = inputDescriptor
+            val decrypted = ParcelFileDescriptor.AutoCloseOutputStream(outputDescriptor).use { output ->
+                decryptToOutput(vaultFile, output)
+            }
+            writer = null
+            if (!decrypted || !VaultAccessController.isUnlocked()) {
+                null
+            } else {
+                Os.lseek(inputDescriptor.fileDescriptor, 0, OsConstants.SEEK_SET)
+                reader = null
+                inputDescriptor
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "openDecryptedFile failed id=${vaultFile.id}", e)
+            null
+        } finally {
+            tempFile.delete()
+            writer?.close()
+            reader?.close()
+        }
     }
 
     fun migrateLegacyIfNeeded() {
@@ -278,8 +304,8 @@ class FileVaultManager(private val context: Context) {
             val key = getSecretKey() ?: return
             val cipher = Cipher.getInstance(ALGORITHM)
             val json = FileInputStream(metadataFile).use { fis ->
-                val iv = ByteArray(12)
-                if (fis.read(iv) != 12) return
+                val iv = ByteArray(IV_SIZE)
+                if (fis.read(iv) != IV_SIZE) return
                 cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
                 val data = fis.readBytes()
                 val decrypted = cipher.doFinal(data)
@@ -297,122 +323,18 @@ class FileVaultManager(private val context: Context) {
         } catch (e: Exception) { metadataFile.delete() }
     }
 
-    fun prepareFileForSharing(vaultFile: VaultFile): Boolean {
-        if (!VaultAccessController.isUnlocked()) {
-            Log.w(TAG, "prepareFileForSharing denied locked id=${vaultFile.id}")
-            return false
-        }
-
-        val tempFile = getBridgeFile(context, vaultFile)
-        if (tempFile.exists() && tempFile.length() == vaultFile.size) {
-            Log.i(TAG, "prepareFileForSharing bridge hit id=${vaultFile.id} length=${tempFile.length()} path=${tempFile.absolutePath}")
-            return true
-        }
-
-        return try {
-            FileOutputStream(tempFile).use { output ->
-                if (!decryptToOutput(vaultFile, output)) {
-                    tempFile.delete()
-                    return false
-                }
-            }
-            if (!VaultAccessController.isUnlocked()) {
-                tempFile.delete()
-                return false
-            }
-            tempFile.parentFile?.setExecutable(true, false)
-            tempFile.parentFile?.setReadable(true, false)
-            tempFile.setReadable(true, false)
-            Log.i(TAG, "prepareFileForSharing ready id=${vaultFile.id} length=${tempFile.length()} expected=${vaultFile.size} path=${tempFile.absolutePath}")
-            true
-        } catch (e: Exception) {
-            Log.w(TAG, "prepareFileForSharing failed id=${vaultFile.id}", e)
-            tempFile.delete()
-            false
-        }
-    }
-
-    fun prepareMediaStoreUri(vaultFile: VaultFile): Uri? =
-        synchronized(mediaBridgeLocks.computeIfAbsent(vaultFile.id) { Any() }) {
-            prepareMediaStoreUriLocked(vaultFile)
-        }
-
-    private fun prepareMediaStoreUriLocked(vaultFile: VaultFile): Uri? {
-        val collection = mediaCollection(vaultFile.mimeType) ?: return null
-        if (!VaultAccessController.isUnlocked()) {
-            Log.w(TAG, "prepareMediaStoreUri denied locked id=${vaultFile.id}")
-            return null
-        }
-
-        val relativePath = mediaBridgeRelativePath(vaultFile.mimeType)
-        val displayName = mediaBridgeName(vaultFile)
-        findMediaBridgeUri(
-            context,
-            collection,
-            displayName,
-            relativePath,
-            vaultFile.size
-        )?.let {
-            Log.i(TAG, "prepareMediaStoreUri hit id=${vaultFile.id} uri=$it")
-            return it
-        }
-
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
-            put(MediaStore.MediaColumns.MIME_TYPE, vaultFile.mimeType)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
-            put(MediaStore.MediaColumns.SIZE, vaultFile.size)
-            put(MediaStore.MediaColumns.IS_PENDING, 1)
-            put(MediaStore.MediaColumns.DATE_MODIFIED, System.currentTimeMillis() / 1000)
-        }
-
-        val uri = try {
-            context.contentResolver.insert(collection, values)
-        } catch (e: Exception) {
-            Log.w(TAG, "prepareMediaStoreUri insert failed id=${vaultFile.id}", e)
-            null
-        } ?: return null
-
-        return try {
-            context.contentResolver.openOutputStream(uri, "w")?.use { output ->
-                if (!decryptToOutput(vaultFile, output)) {
-                    context.contentResolver.delete(uri, null, null)
-                    return null
-                }
-            } ?: run {
-                context.contentResolver.delete(uri, null, null)
-                return null
-            }
-            if (!VaultAccessController.isUnlocked()) {
-                context.contentResolver.delete(uri, null, null)
-                return null
-            }
-            values.clear()
-            values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-            values.put(MediaStore.MediaColumns.SIZE, vaultFile.size)
-            values.put(MediaStore.MediaColumns.DATE_MODIFIED, System.currentTimeMillis() / 1000)
-            context.contentResolver.update(uri, values, null, null)
-            Log.i(TAG, "prepareMediaStoreUri ready id=${vaultFile.id} uri=$uri length=${vaultFile.size}")
-            uri
-        } catch (e: Exception) {
-            Log.w(TAG, "prepareMediaStoreUri failed id=${vaultFile.id}", e)
-            context.contentResolver.delete(uri, null, null)
-            null
-        }
-    }
-
     fun importFile(uri: Uri): Boolean {
         return try {
             val originalName = getFileName(uri) ?: "file_${System.currentTimeMillis()}"
-            val size = getFileSize(uri)
             val mimeType = resolveMimeType(originalName, uri)
             val fileId = UUID.randomUUID().toString()
             val destFile = File(vaultDir, "$fileId.bin")
+            val originalPath = getFilePathFromUri(uri)
             
             val key = getSecretKey() ?: return false
             val cipher = Cipher.getInstance(ALGORITHM)
             cipher.init(Cipher.ENCRYPT_MODE, key)
-            
+            var size = 0L
             context.contentResolver.openInputStream(uri)?.use { isStream ->
                 FileOutputStream(destFile).use { fos ->
                     fos.write(cipher.iv)
@@ -420,6 +342,7 @@ class FileVaultManager(private val context: Context) {
                     while (true) {
                         val read = isStream.read(buffer)
                         if (read == -1) break
+                        size += read
                         val encrypted = cipher.update(buffer, 0, read)
                         if (encrypted != null) fos.write(encrypted)
                     }
@@ -429,8 +352,8 @@ class FileVaultManager(private val context: Context) {
                 }
             } ?: return false
             
-            dbHelper.insertFile(fileId, originalName, size, mimeType, getFilePathFromUri(uri))
-            cleanupOriginal(uri, getFilePathFromUri(uri))
+            dbHelper.insertFile(fileId, originalName, size, mimeType, originalPath)
+            cleanupOriginal(uri, originalPath)
             true
         } catch (e: Exception) { false }
     }
@@ -472,33 +395,24 @@ class FileVaultManager(private val context: Context) {
             File(restoreDir, vaultFile.name)
         }
 
+        val decryptedFile = openDecryptedFile(vaultFile) ?: return false
         return try {
-            val key = getSecretKey() ?: return false
-            val cipher = Cipher.getInstance(ALGORITHM)
-            FileInputStream(vaultFile.file).use { fis ->
-                val iv = ByteArray(12)
-                if (fis.read(iv) != 12) return false
-                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
-                FileOutputStream(targetFile).use { fos ->
-                    val buffer = ByteArray(IO_BUFFER_SIZE)
-                    while (true) {
-                        val read = fis.read(buffer)
-                        if (read == -1) break
-                        val decrypted = cipher.update(buffer, 0, read)
-                        if (decrypted != null) fos.write(decrypted)
-                    }
-                    val finalBlock = cipher.doFinal()
-                    if (finalBlock != null) fos.write(finalBlock)
-                    fos.flush()
+            ParcelFileDescriptor.AutoCloseInputStream(decryptedFile).use { input ->
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output, IO_BUFFER_SIZE)
+                    output.flush()
                 }
             }
-            val scanIntent = android.content.Intent(android.content.Intent.ACTION_MEDIA_SCANNER_SCAN_FILE).apply {
+            val scanIntent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE).apply {
                 data = Uri.fromFile(targetFile)
             }
             context.sendBroadcast(scanIntent)
             deleteFile(vaultFile)
             true
-        } catch (e: Exception) { false }
+        } catch (e: Exception) {
+            targetFile.delete()
+            false
+        }
     }
 
     fun deleteFiles(vaultFiles: List<VaultFile>) {
@@ -517,7 +431,7 @@ class FileVaultManager(private val context: Context) {
     fun getFileById(id: String): VaultFile? {
         val entry = dbHelper.getFileById(id) ?: return null
         val binFile = File(vaultDir, "${entry.id}.bin")
-        return if (binFile.exists()) entry.copy(file = binFile) else null
+        return if (binFile.exists()) attachFile(entry, binFile) else null
     }
 
     fun getVaultFiles(): List<VaultFile> {
@@ -525,9 +439,15 @@ class FileVaultManager(private val context: Context) {
         val binFiles = vaultDir.listFiles { f -> f.extension == "bin" }?.associateBy { it.nameWithoutExtension } ?: emptyMap()
         return dbFiles.mapNotNull { entry ->
             val binFile = binFiles[entry.id]
-            if (binFile != null) entry.copy(file = binFile)
+            if (binFile != null) attachFile(entry, binFile)
             else { dbHelper.deleteFile(entry.id); null }
         }
+    }
+
+    private fun attachFile(entry: VaultFile, file: File): VaultFile {
+        val size = (file.length() - IV_SIZE - GCM_TAG_SIZE).coerceAtLeast(0)
+        if (size != entry.size) dbHelper.updateFileSize(entry.id, size)
+        return entry.copy(size = size, file = file)
     }
 
     fun decryptToBitmap(vaultFile: VaultFile): Bitmap? {
@@ -544,16 +464,10 @@ class FileVaultManager(private val context: Context) {
         }
 
         return try {
-            val key = getSecretKey() ?: return null
-            val cipher = Cipher.getInstance(ALGORITHM)
-            FileInputStream(vaultFile.file).use { fis ->
-                val iv = ByteArray(12)
-                if (fis.read(iv) != 12) return null
-                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
-                val data = fis.readBytes()
-                val decryptedData = cipher.doFinal(data)
+            val decryptedFile = openDecryptedFile(vaultFile) ?: return null
+            ParcelFileDescriptor.AutoCloseInputStream(decryptedFile).use { input ->
                 val options = BitmapFactory.Options().apply { inSampleSize = 4 }
-                val bitmap = BitmapFactory.decodeByteArray(decryptedData, 0, decryptedData.size, options)
+                val bitmap = BitmapFactory.decodeStream(input, null, options)
                 if (bitmap != null) {
                     thumbnailCache.put(vaultFile.id, bitmap)
                     FileOutputStream(cachedThumb).use { fos ->
@@ -580,36 +494,16 @@ class FileVaultManager(private val context: Context) {
         }
 
         return try {
-            val tempFile = File(context.cacheDir, "v_thumb_${vaultFile.id}.mp4")
-            val key = getSecretKey() ?: return null
-            val cipher = Cipher.getInstance(ALGORITHM)
-            FileInputStream(vaultFile.file).use { fis ->
-                val iv = ByteArray(12)
-                if (fis.read(iv) != 12) return null
-                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
-                
-                FileOutputStream(tempFile).use { fos ->
-                    val buffer = ByteArray(IO_BUFFER_SIZE)
-                    var totalRead = 0
-                    val maxRead = 1024 * 512
-                    while (totalRead < maxRead) {
-                        val read = fis.read(buffer, 0, minOf(buffer.size, maxRead - totalRead))
-                        if (read == -1) break
-                        val decrypted = cipher.update(buffer, 0, read)
-                        if (decrypted != null) {
-                            fos.write(decrypted)
-                            totalRead += decrypted.size
-                        }
-                    }
-                    val finalBlock = cipher.doFinal()
-                    if (finalBlock != null) fos.write(finalBlock)
+            val decryptedFile = openDecryptedFile(vaultFile) ?: return null
+            val bitmap = decryptedFile.use { descriptor ->
+                val retriever = MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(descriptor.fileDescriptor)
+                    retriever.getFrameAtTime(1000000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                } finally {
+                    retriever.release()
                 }
             }
-            val retriever = MediaMetadataRetriever()
-            retriever.setDataSource(tempFile.absolutePath)
-            val bitmap = retriever.getFrameAtTime(1000000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-            retriever.release()
-            tempFile.delete()
             if (bitmap != null) {
                 thumbnailCache.put(cacheKey, bitmap)
                 FileOutputStream(cachedThumb).use { fos ->
@@ -620,10 +514,6 @@ class FileVaultManager(private val context: Context) {
         } catch (e: Exception) { null }
     }
 
-    fun clearPublicBridge(force: Boolean = false) {
-        if (force) clearDecryptedCache(context) else clearBridgeCache(context)
-    }
-
     private fun getFileName(uri: Uri): String? {
         context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) {
@@ -632,16 +522,6 @@ class FileVaultManager(private val context: Context) {
             }
         }
         return null
-    }
-
-    private fun getFileSize(uri: Uri): Long {
-        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val index = cursor.getColumnIndex(OpenableColumns.SIZE)
-                if (index != -1) return cursor.getLong(index)
-            }
-        }
-        return 0L
     }
 
     private fun getFilePathFromUri(uri: Uri): String? {
@@ -690,6 +570,10 @@ class FileVaultManager(private val context: Context) {
             return list
         }
         fun deleteFile(id: String) { writableDatabase.delete("files", "id=?", arrayOf(id)) }
+        fun updateFileSize(id: String, size: Long) {
+            val values = ContentValues().apply { put("size", size) }
+            writableDatabase.update("files", values, "id=?", arrayOf(id))
+        }
     }
 }
 

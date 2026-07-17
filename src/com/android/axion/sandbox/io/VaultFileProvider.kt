@@ -18,7 +18,6 @@ package com.android.axion.sandbox.io
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.ClipDescription
-import android.content.Context
 import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
@@ -30,14 +29,8 @@ import android.provider.BaseColumns
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Log
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
 
 class VaultFileProvider : ContentProvider() {
-    private val bridgeLock = Any()
-
     private fun caller(): String = try {
         "${getCallingPackage() ?: "unknown"}/${Binder.getCallingUid()}"
     } catch (e: SecurityException) {
@@ -52,8 +45,8 @@ class VaultFileProvider : ContentProvider() {
     }
 
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor? {
-        if (!VaultAccessController.isUnlocked()) {
-            Log.w(TAG, "openFile denied locked caller=${caller()} uri=$uri mode=$mode")
+        if (mode != "r" || !VaultAccessController.isUnlocked()) {
+            Log.w(TAG, "openFile denied caller=${caller()} uri=$uri mode=$mode")
             return null
         }
 
@@ -64,60 +57,9 @@ class VaultFileProvider : ContentProvider() {
             Log.w(TAG, "openFile missing id=$fileId caller=${caller()} uri=$uri")
             return null
         }
-        val tempFile = FileVaultManager.getBridgeFile(context, vaultFile)
-        Log.i(TAG, "openFile caller=${caller()} id=$fileId mode=$mode mime=${vaultFile.mimeType} exists=${tempFile.exists()} length=${tempFile.length()} expected=${vaultFile.size} path=${tempFile.absolutePath}")
-
-        return if (tempFile.exists() && tempFile.length() == vaultFile.size) {
-            ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
-        } else {
-            openSeekableFile(context, vaultManager, vaultFile)
-        }
+        Log.i(TAG, "openFile caller=${caller()} id=$fileId mode=$mode mime=${vaultFile.mimeType} size=${vaultFile.size}")
+        return vaultManager.openDecryptedFile(vaultFile)
     }
-
-    private fun openSeekableFile(context: Context, vaultManager: FileVaultManager, vaultFile: VaultFile): ParcelFileDescriptor? =
-        synchronized(bridgeLock) {
-            try {
-                val tempFile = FileVaultManager.getBridgeFile(context, vaultFile)
-                if (tempFile.exists() && tempFile.length() == vaultFile.size) {
-                    return ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
-                }
-
-                val key = vaultManager.getMasterKey() ?: run {
-                    Log.w(TAG, "openSeekableFile missing key caller=${caller()} id=${vaultFile.id}")
-                    return null
-                }
-                FileInputStream(vaultFile.file).use { fis ->
-                    val iv = ByteArray(12)
-                    if (fis.read(iv) == 12) {
-                        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
-
-                        FileOutputStream(tempFile).use { fos ->
-                            val buffer = ByteArray(65536)
-                            while (true) {
-                                val read = fis.read(buffer)
-                                if (read == -1) break
-                                val decrypted = cipher.update(buffer, 0, read)
-                                if (decrypted != null) fos.write(decrypted)
-                            }
-                            val finalBlock = cipher.doFinal()
-                            if (finalBlock != null) fos.write(finalBlock)
-                            fos.flush()
-                        }
-                    } else {
-                        Log.w(TAG, "openSeekableFile short iv caller=${caller()} id=${vaultFile.id}")
-                    }
-                }
-                tempFile.parentFile?.setExecutable(true, false)
-                tempFile.parentFile?.setReadable(true, false)
-                tempFile.setReadable(true, false)
-                Log.i(TAG, "openSeekableFile ready caller=${caller()} id=${vaultFile.id} length=${tempFile.length()} expected=${vaultFile.size} path=${tempFile.absolutePath}")
-                ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
-            } catch (e: Exception) {
-                Log.w(TAG, "openSeekableFile failed caller=${caller()} id=${vaultFile.id}", e)
-                null
-            }
-        }
 
     override fun openAssetFile(uri: Uri, mode: String): AssetFileDescriptor? {
         val descriptor = openFile(uri, mode) ?: return null
@@ -161,20 +103,13 @@ class VaultFileProvider : ContentProvider() {
 
         val columnNames = projection ?: arrayOf(
             BaseColumns._ID, OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE,
-            MediaStore.MediaColumns.MIME_TYPE, MediaStore.MediaColumns.DATA,
-            MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE,
+            MediaStore.MediaColumns.MIME_TYPE,
             MediaStore.MediaColumns.DATE_MODIFIED
         )
         
         val cursor = MatrixCursor(columnNames, 1)
         val row = cursor.newRow()
-        val needsDataPath = columnNames.contains(MediaStore.MediaColumns.DATA)
-        val bridgePath = if (needsDataPath && vaultManager.prepareFileForSharing(vaultFile)) {
-            FileVaultManager.getBridgeFile(context, vaultFile).absolutePath
-        } else {
-            null
-        }
-        Log.i(TAG, "query caller=${caller()} id=$fileId projection=${columnNames.contentToString()} mime=${vaultFile.mimeType} needsData=$needsDataPath bridge=$bridgePath size=${vaultFile.size}")
+        Log.i(TAG, "query caller=${caller()} id=$fileId projection=${columnNames.contentToString()} mime=${vaultFile.mimeType} size=${vaultFile.size}")
 
         for (column in columnNames) {
             when (column) {
@@ -182,7 +117,6 @@ class VaultFileProvider : ContentProvider() {
                 OpenableColumns.DISPLAY_NAME, MediaStore.MediaColumns.DISPLAY_NAME -> row.add(vaultFile.name)
                 OpenableColumns.SIZE, MediaStore.MediaColumns.SIZE -> row.add(vaultFile.size)
                 MediaStore.MediaColumns.MIME_TYPE -> row.add(vaultFile.mimeType)
-                MediaStore.MediaColumns.DATA -> row.add(bridgePath)
                 MediaStore.MediaColumns.DATE_MODIFIED -> row.add(System.currentTimeMillis() / 1000)
                 else -> row.add(null)
             }

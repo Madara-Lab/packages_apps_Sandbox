@@ -19,16 +19,13 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
-import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.*
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -75,24 +72,13 @@ fun VaultTab(
     val vaultManager = remember { FileVaultManager(context) }
     var files by remember { mutableStateOf<List<VaultFile>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
-    val preparedMediaUris = remember { mutableStateMapOf<String, Uri>() }
 
     fun refreshFiles() {
-        val shouldEagerPrepareVideo = isLoading
         scope.launch(Dispatchers.IO) {
             try {
                 vaultManager.migrateLegacyIfNeeded()
                 val list = vaultManager.getVaultFiles()
-                val eagerFile = if (shouldEagerPrepareVideo) {
-                    list.firstOrNull { it.mimeType.startsWith("video/") }
-                } else {
-                    null
-                }
-                val eagerUri = eagerFile?.let { vaultManager.prepareMediaStoreUri(it) }
                 withContext(Dispatchers.Main) {
-                    if (eagerFile != null && eagerUri != null) {
-                        preparedMediaUris[eagerFile.id] = eagerUri
-                    }
                     files = list
                     isLoading = false
                 }
@@ -108,7 +94,6 @@ fun VaultTab(
             if (event == Lifecycle.Event.ON_RESUME) {
                 onPickingFilesChange(false)
                 refreshFiles()
-                scope.launch(Dispatchers.IO) { vaultManager.clearPublicBridge() }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -129,29 +114,6 @@ fun VaultTab(
     }
 
     LaunchedEffect(Unit) { refreshFiles() }
-
-    LaunchedEffect(files) {
-        val activeIds = files.mapTo(HashSet(files.size)) { it.id }
-        preparedMediaUris.keys.toList().forEach {
-            if (it !in activeIds) preparedMediaUris.remove(it)
-        }
-
-        val (pendingVideos, pendingImages) = files
-            .filter { it.isMediaStoreShareable() && preparedMediaUris[it.id] == null }
-            .partition { it.mimeType.startsWith("video/") }
-        val pendingMedia = pendingVideos + pendingImages
-        withContext(Dispatchers.IO) {
-            pendingMedia.forEach { file ->
-                ensureActive()
-                val uri = vaultManager.prepareMediaStoreUri(file)
-                if (uri != null) {
-                    withContext(Dispatchers.Main) {
-                        preparedMediaUris[file.id] = uri
-                    }
-                }
-            }
-        }
-    }
 
     val pickFilesLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
@@ -207,35 +169,8 @@ fun VaultTab(
     }
 
     fun handleOpenFile(file: VaultFile) {
-        isProcessing = true
-        processingMessage = "Opening..."
-        val preparedUri = preparedMediaUris[file.id]
-        scope.launch(Dispatchers.IO) {
-            try {
-                val shareUri = preparedUri ?: withTimeoutOrNull(45000) {
-                    vaultManager.prepareMediaStoreUri(file)
-                        ?: if (vaultManager.prepareFileForSharing(file)) vaultContentUri(file) else null
-                }
-                
-                withContext(Dispatchers.Main) {
-                    isProcessing = false
-                    if (shareUri != null) {
-                        if (file.isMediaStoreShareable() && shareUri.authority != VAULT_AUTHORITY) {
-                            preparedMediaUris[file.id] = shareUri
-                        }
-                        onPickingFilesChange(true)
-                        openVaultFileInternal(context, file, shareUri)
-                    } else {
-                        Toast.makeText(context, "Failed to open", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    isProcessing = false
-                    Toast.makeText(context, "Error", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
+        onPickingFilesChange(true)
+        openVaultFileInternal(context, file, vaultContentUri(file))
     }
 
     val videos = remember(files) { files.filter { it.mimeType.startsWith("video/") } }
@@ -448,9 +383,6 @@ private fun FileListItem(file: VaultFile, isSelected: Boolean, onClick: () -> Un
 
 private fun vaultContentUri(file: VaultFile): Uri =
     Uri.parse("content://$VAULT_AUTHORITY/${file.id}")
-
-private fun VaultFile.isMediaStoreShareable(): Boolean =
-    mimeType.startsWith("image/") || mimeType.startsWith("video/")
 
 private fun openVaultFileInternal(context: Context, file: VaultFile, uri: Uri) {
     try {
