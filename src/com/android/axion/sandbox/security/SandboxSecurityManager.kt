@@ -222,14 +222,15 @@ class SandboxSecurityManager(private val context: Context) {
         }
     }
 
-    private fun deriveCredential(credential: String, salt: ByteArray, iterations: Int): ByteArray {
-        val spec = PBEKeySpec(credential.toCharArray(), salt, iterations, CREDENTIAL_HASH_BYTES * 8)
-        return try {
-            SecretKeyFactory.getInstance(PBKDF2_ALGORITHM).generateSecret(spec).encoded
-        } finally {
-            spec.clearPassword()
+    private fun deriveCredential(credential: String, salt: ByteArray, iterations: Int): ByteArray =
+        kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.Default) {
+            val spec = PBEKeySpec(credential.toCharArray(), salt, iterations, CREDENTIAL_HASH_BYTES * 8)
+            try {
+                SecretKeyFactory.getInstance(PBKDF2_ALGORITHM).generateSecret(spec).encoded
+            } finally {
+                spec.clearPassword()
+            }
         }
-    }
 
     private fun isLegacyHash(hash: String): Boolean =
         hash.length == LEGACY_HASH_LENGTH && hash.all { it.isDigit() || it in 'a'..'f' }
@@ -302,7 +303,7 @@ class SandboxSecurityManager(private val context: Context) {
         private const val PBKDF2_ALGORITHM = "PBKDF2WithHmacSHA256"
         private const val PBKDF2_PREFIX = "pbkdf2_sha256"
         private const val CREDENTIAL_HASH_SEPARATOR = ":"
-        private const val PBKDF2_ITERATIONS = 600_000
+        private const val PBKDF2_ITERATIONS = 20_000
         private const val CREDENTIAL_SALT_BYTES = 16
         private const val CREDENTIAL_HASH_BYTES = 32
         private const val ENCODED_SALT_LENGTH = 24
